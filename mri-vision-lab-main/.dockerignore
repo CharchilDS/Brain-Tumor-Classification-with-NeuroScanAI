@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.gitignore
+*.md
+.env
+.env.*
+backend
+!backend/.dockerignore
+.DS_Store
+*.log
+coverage
+.nyc_output
