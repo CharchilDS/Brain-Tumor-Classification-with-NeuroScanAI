@@ -1,32 +1,44 @@
-# Build stage
-FROM node:20-alpine AS builder
+# ─── Stage 1: Build React Frontend ───────────────────────────────────────────
+FROM node:20-alpine AS frontend-builder
 
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
 RUN npm ci
 
-# Copy source code
 COPY . .
 
-# Build argument for API URL
-ARG VITE_API_URL=http://localhost:8000
+ARG VITE_API_URL=/api
 ENV VITE_API_URL=$VITE_API_URL
 
-# Build the app
 RUN npm run build
 
-# Production stage
-FROM nginx:alpine
+# ─── Stage 2: Final Image (Python + nginx + supervisord) ──────────────────────
+FROM python:3.10-slim
 
-# Copy built assets
-COPY --from=builder /app/dist /usr/share/nginx/html
+# Install nginx and supervisord
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nginx \
+    supervisor \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy nginx config for SPA routing
+# ─── Backend setup ────────────────────────────────────────────────────────────
+WORKDIR /app/backend
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/ .
+
+# ─── Frontend setup ───────────────────────────────────────────────────────────
+COPY --from=frontend-builder /app/dist /usr/share/nginx/html
+
+# ─── Nginx config ─────────────────────────────────────────────────────────────
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# Expose port
-EXPOSE 80
+# ─── Supervisord config ───────────────────────────────────────────────────────
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 7860
+
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
