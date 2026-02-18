@@ -62,6 +62,24 @@ CLASS_INFO = {
 model = None
 
 
+def download_model_from_gdrive():
+    """Download model from Google Drive if not present locally."""
+    if os.path.exists(MODEL_PATH):
+        logger.info(f"Model already exists at {MODEL_PATH}, skipping download.")
+        return True
+    try:
+        import gdown
+        logger.info("Model not found locally. Downloading from Google Drive...")
+        file_id = "1pUB69sXWLrzy-FXIa0WkOGes_UdOye6o"
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, MODEL_PATH, quiet=False)
+        logger.info(f"✅ Model downloaded to {MODEL_PATH}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to download model: {e}")
+        return False
+
+
 def load_model():
     """Load the Keras model."""
     global model
@@ -70,6 +88,10 @@ def load_model():
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
         import tensorflow as tf
         logging.getLogger('tensorflow').setLevel(logging.ERROR)
+
+        # Download model if not present
+        if not download_model_from_gdrive():
+            return False
 
         logger.info(f"Loading model from {MODEL_PATH}...")
 
@@ -86,7 +108,6 @@ def load_model():
         return True
     except FileNotFoundError:
         logger.error(f"❌ Model file not found: {MODEL_PATH}")
-        logger.error("   Please ensure brain_tumor_model.keras is in the backend directory.")
         return False
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
@@ -96,12 +117,10 @@ def load_model():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    # Startup
     success = load_model()
     if not success:
         logger.warning("⚠️  Server starting without model - predictions will fail")
     yield
-    # Shutdown
     logger.info("Shutting down...")
 
 
@@ -113,7 +132,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS - allow all origins for development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -124,76 +142,40 @@ app.add_middleware(
 
 
 def is_likely_brain_mri(image_bytes: bytes) -> bool:
-    """
-    Validate that the uploaded image is likely a brain MRI scan.
-
-    Checks:
-    1. Grayscale-like appearance — MRIs have very similar R, G, B channels.
-    2. Low average brightness — MRI scans are mostly dark with bright regions.
-    3. Low color saturation — MRIs are not colorful images.
-
-    Returns True if the image passes all checks, False otherwise.
-    """
+    """Validate that the uploaded image is likely a brain MRI scan."""
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     img_array = np.array(image, dtype=np.float32)
 
     r, g, b = img_array[:, :, 0], img_array[:, :, 1], img_array[:, :, 2]
 
-    # Check 1: Channel similarity (MRIs are grayscale → R ≈ G ≈ B)
     rg_diff = np.mean(np.abs(r - g))
     gb_diff = np.mean(np.abs(g - b))
     channel_diff = (rg_diff + gb_diff) / 2
-    if channel_diff > 12:  # High color variance → not an MRI
+    if channel_diff > 12:
         logger.info(f"MRI validation failed: high channel diff = {channel_diff:.2f}")
         return False
 
-    # Check 2: Mostly dark background (MRI scans have a large black background)
     brightness = np.mean(img_array)
-    if brightness > 160:  # Very bright image → not an MRI
+    if brightness > 160:
         logger.info(f"MRI validation failed: high brightness = {brightness:.2f}")
         return False
-
-    # Check 3: Low color saturation via HSV
-    image_hsv = image.convert("HSV") if hasattr(image, "convert") else None
-    if image_hsv:
-        hsv_array = np.array(image_hsv, dtype=np.float32)
-        mean_saturation = np.mean(hsv_array[:, :, 1])
-        if mean_saturation > 40:  # Highly saturated → colorful, not an MRI
-            logger.info(f"MRI validation failed: high saturation = {mean_saturation:.2f}")
-            return False
 
     return True
 
 
 def preprocess_image(image_bytes: bytes) -> np.ndarray:
-    """
-    Preprocess image for model inference.
-
-    - Resize to 224x224
-    - Convert to RGB
-    - Normalize to [0, 1]
-    """
+    """Preprocess image for model inference."""
     image = Image.open(io.BytesIO(image_bytes))
-
-    # Convert to RGB if necessary (handles grayscale, RGBA, etc.)
     if image.mode != "RGB":
         image = image.convert("RGB")
-
-    # Resize
     image = image.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
-
-    # Convert to numpy array and normalize
     img_array = np.array(image, dtype=np.float32)
-
-    # Add batch dimension
     img_array = np.expand_dims(img_array, axis=0)
-
     return img_array
 
 
 @app.get("/")
 async def root():
-    """Health check endpoint."""
     return {
         "status": "healthy",
         "service": "Brain Tumor Classification API",
@@ -203,7 +185,6 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Detailed health check."""
     return {
         "status": "healthy" if model is not None else "degraded",
         "model_loaded": model is not None,
@@ -215,72 +196,34 @@ async def health_check():
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    """
-    Predict brain tumor class from MRI image.
-
-    Parameters:
-        file: Image file (PNG, JPG, JPEG)
-
-    Returns:
-        {
-            "predictedClass": "glioma",
-            "label": "Glioma",
-            "confidence": 94.5,
-            "probabilities": {
-                "Glioma": 94.5,
-                "Meningioma": 3.2,
-                "No Tumor": 1.5,
-                "Pituitary": 0.8
-            },
-            "description": "...",
-            "severity": "high"
-        }
-    """
-    # Check if model is loaded
     if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not loaded. Please check server logs.",
-        )
+        raise HTTPException(status_code=503, detail="Model not loaded.")
 
-    # Validate file type
     if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type: {file.content_type}. Please upload an image.",
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid file type: {file.content_type}.")
 
     try:
-        # Read and preprocess image
         image_bytes = await file.read()
 
-        # ── MRI Validation ──────────────────────────────────────────────────
         if not is_likely_brain_mri(image_bytes):
             raise HTTPException(
                 status_code=400,
-                detail="Invalid image. Please upload a Brain MRI scan only. "
-                       "The uploaded image does not appear to be an MRI scan.",
+                detail="Invalid image. Please upload a Brain MRI scan only.",
             )
-        # ────────────────────────────────────────────────────────────────────
 
         img_array = preprocess_image(image_bytes)
-
-        # Run inference
         predictions = model.predict(img_array, verbose=0)
         probabilities = predictions[0]
 
-        # Get predicted class
         predicted_idx = int(np.argmax(probabilities))
         predicted_class = LABELS[predicted_idx]
         confidence = float(probabilities[predicted_idx]) * 100
 
-        # Build probability dict with display labels
         prob_dict = {}
         for i, label in enumerate(LABELS):
             display_label = CLASS_INFO[label]["label"]
             prob_dict[display_label] = round(float(probabilities[i]) * 100, 1)
 
-        # Get class info
         info = CLASS_INFO[predicted_class]
 
         return JSONResponse({
@@ -292,12 +235,11 @@ async def predict(file: UploadFile = File(...)):
             "severity": info["severity"],
         })
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction failed: {str(e)}",
-        )
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 
 if __name__ == "__main__":
