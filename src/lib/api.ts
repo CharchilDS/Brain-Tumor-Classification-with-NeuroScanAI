@@ -5,7 +5,7 @@
  */
 
 // API base URL - uses environment variable or defaults to localhost
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
 export interface PredictionResult {
   predictedClass: string;
